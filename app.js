@@ -980,6 +980,7 @@ $('#fileImport').addEventListener('change', async e => {
   const num = v => (Number.isFinite(+v) ? +v : 0);
   const isId = v => typeof v === 'string' && /^[\w-]{1,64}$/.test(v);
   const isImg = v => typeof v === 'string' && /^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(v);
+  const PHOTO_TYPE = /^image\/(jpeg|png|webp|gif|heic|heif)$/, VIDEO_TYPE = /^video\/(mp4|quicktime|webm|x-m4v|3gpp)$/;
   try {
     let data, items; // items: [{ meta, getBlob }]
     const head = new TextDecoder().decode(await f.slice(0, 20).arrayBuffer());
@@ -993,7 +994,7 @@ $('#fileImport').addEventListener('change', async e => {
         getBlob: () => {
           const o = num(m.offset), n = num(m.size);
           if (o < 0 || n <= 0 || start + o + n > f.size) throw new Error('bad media range');
-          return f.slice(start + o, start + o + n, /^(image|video)\/[\w.+-]+$/.test(m.type) ? m.type : '');
+          return f.slice(start + o, start + o + n, PHOTO_TYPE.test(m.type) || VIDEO_TYPE.test(m.type) ? m.type : '');
         },
       }));
     } else {
@@ -1023,10 +1024,10 @@ $('#fileImport').addEventListener('change', async e => {
       let b;
       try { b = await getBlob(); } catch { continue; }
       const video = m.kind === 'video';
-      if (!(video ? /^video\//.test(b.type) : /^image\//.test(b.type || 'image/jpeg'))) continue;
+      if (!(video ? VIDEO_TYPE.test(b.type) : PHOTO_TYPE.test(b.type))) continue;
       const rec = { id: m.id, spotId: m.spotId, kind: video ? 'video' : 'photo', thumb: isImg(m.thumb) ? m.thumb : '', takenAt: num(m.takenAt) || null, addedAt: num(m.addedAt) || Date.now() };
       if (video) await putVideo({ ...rec, type: b.type, duration: num(m.duration), size: b.size }, b, true);
-      else await DB.put('photos', { ...rec, type: b.type || 'image/jpeg', data: await b.arrayBuffer() });
+      else await DB.put('photos', { ...rec, type: b.type, data: await b.arrayBuffer() });
       touched.add(m.spotId); np++; if (video) nv++;
     }
     for (const id of touched) { const s = spots.get(id); await recount(s); await DB.put('spots', s); renderMarker(s); }
