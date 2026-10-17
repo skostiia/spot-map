@@ -7,6 +7,7 @@ const ICON = {
   plus: '<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
   place: '<svg viewBox="0 0 24 24"><path d="M12 21s-6.5-6.2-6.5-11a6.5 6.5 0 0 1 13 0c0 4.8-6.5 11-6.5 11z"/><circle cx="12" cy="10" r="2.3"/></svg>',
   photo: '<svg viewBox="0 0 24 24"><rect x="3.5" y="5.5" width="17" height="13" rx="2"/><path d="M3.5 15l4.5-4 4 3.5 3-2.5 5.5 4.5"/></svg>',
+  play: '<svg viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5z" fill="currentColor" stroke="none"/></svg>',
 };
 const DEFAULT_VIEW = { c: [27.9659, -82.8001], z: 12 }; // Clearwater, FL
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
@@ -23,11 +24,12 @@ const store = {
 let dbPromise;
 function db() {
   return dbPromise ||= new Promise((res, rej) => {
-    const r = indexedDB.open('spotmap', 1);
+    const r = indexedDB.open('spotmap', 2);
     r.onupgradeneeded = () => {
       const d = r.result;
-      d.createObjectStore('spots', { keyPath: 'id' });
-      d.createObjectStore('photos', { keyPath: 'id' }).createIndex('spotId', 'spotId');
+      if (!d.objectStoreNames.contains('spots')) d.createObjectStore('spots', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('photos')) d.createObjectStore('photos', { keyPath: 'id' }).createIndex('spotId', 'spotId');
+      if (!d.objectStoreNames.contains('chunks')) d.createObjectStore('chunks', { keyPath: 'id' }); // video pieces
     };
     r.onsuccess = () => { r.result.onversionchange = () => r.result.close(); res(r.result); };
     r.onerror = () => rej(r.error);
@@ -273,12 +275,11 @@ function locate(fly = true) {
     if (!navigator.geolocation) { toast('This device has no location.'); return res(null); }
     navigator.geolocation.getCurrentPosition(p => {
       const { latitude: lat, longitude: lng } = p.coords;
-      if (!meDot) {
-        const el = document.createElement('div');
-        el.className = 'me-dot';
-        meDot = new maplibregl.Marker({ element: el }).setLngLat(ll(lat, lng)).addTo(map);
-      } else meDot.setLngLat(ll(lat, lng));
+      placeMe(lat, lng);
       if (fly) goTo(lat, lng);
+      myPos = { lat, lng };
+      updateNearest();
+      startWatch();
       res([lat, lng]);
     }, err => {
       toast(err.code === 1
@@ -319,7 +320,15 @@ async function searchPlaces(q) {
   }
 }
 
-/* ---------- Photos ---------- */
+/* ---------- Photos + videos ---------- */
+const isVideoFile = f => /^video\//.test(f.type) || /\.(mov|mp4|m4v|webm|3gp)$/i.test(f.name || '');
+const CHUNK = 8 * 1024 * 1024;
+const mediaLabel = (total, videos = 0) => {
+  const v = videos || 0, ph = Math.max(0, (total || 0) - v);
+  return [ph || !v ? plural(ph, 'photo') : '', v ? plural(v, 'video') : ''].filter(Boolean).join(', ');
+};
+const fmtDur = s => { s = Math.round(s || 0); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+
 function loadImg(file) {
   return new Promise((res, rej) => {
     const url = URL.createObjectURL(file);
@@ -335,7 +344,7 @@ function draw(img, w, h, sx = 0, sy = 0, sw = img.naturalWidth, sh = img.natural
   c.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, w, h);
   return c;
 }
-async function processFile(file) {
+async function processPhoto(file) {
   // One full read. (exifr lite's `pick` option throws, so don't use it.)
   let gps = null, takenAt = null;
   try {
@@ -351,31 +360,138 @@ async function processFile(file) {
     const blob = await new Promise(r => draw(img, Math.round(W * k), Math.round(H * k)).toBlob(r, 'image/jpeg', 0.85));
     const side = Math.min(W, H);
     const thumb = draw(img, 240, 240, (W - side) / 2, (H - side) / 2, side, side).toDataURL('image/jpeg', 0.8);
-    return { blob, thumb, takenAt, gps: gps && isFinite(gps.latitude) && isFinite(gps.longitude) ? gps : null };
+    return { kind: 'photo', blob, thumb, takenAt, gps };
   } finally { URL.revokeObjectURL(url); }
 }
+// Grab one frame for the tile + the length. Never blocks: no frame after 12 s = icon tile.
+// Safari hands back a black canvas if you draw right on 'seeked', so wait for a painted frame
+// (requestVideoFrameCallback) and, if it is still black, try a bit further into the clip.
+function videoPoster(file) {
+  return new Promise(res => {
+    const url = URL.createObjectURL(file);
+    const v = document.createElement('video');
+    v.muted = true; v.playsInline = true; v.preload = 'auto';
+    v.setAttribute('muted', ''); v.setAttribute('playsinline', '');
+    let finished = false, tries = 0;
+    const finish = thumb => {
+      if (finished) return;
+      finished = true; clearTimeout(timer);
+      const out = { thumb, duration: Number.isFinite(v.duration) ? v.duration : 0 };
+      v.removeAttribute('src'); v.load(); URL.revokeObjectURL(url);
+      res(out);
+    };
+    const timer = setTimeout(() => finish(null), 12000);
+    const seekTo = t => { v.currentTime = Math.min(t, Math.max(0, (v.duration || 1) - 0.1)); };
+    const grab = () => {
+      try {
+        const W = v.videoWidth, H = v.videoHeight;
+        if (!W || !H) return finish(null);
+        const side = Math.min(W, H);
+        const c = document.createElement('canvas');
+        c.width = c.height = 240;
+        const g = c.getContext('2d', { willReadFrequently: true });
+        g.drawImage(v, (W - side) / 2, (H - side) / 2, side, side, 0, 0, 240, 240);
+        const px = g.getImageData(0, 0, 240, 240).data;
+        let sum = 0;
+        for (let i = 0; i < px.length; i += 64) sum += px[i] + px[i + 1] + px[i + 2];
+        const dark = sum / (px.length / 64) / 3 < 6;
+        if (dark && tries++ < 3) return seekTo((v.duration || 4) * [0.25, 0.5, 0.75][tries - 1]);
+        finish(c.toDataURL('image/jpeg', 0.8));
+      } catch { finish(null); }
+    };
+    v.addEventListener('loadeddata', () => { v.pause(); seekTo(Math.min(0.5, (v.duration || 1) * 0.1)); }, { once: true });
+    v.addEventListener('seeked', () => {
+      if (v.requestVideoFrameCallback) {
+        let done = false;
+        v.requestVideoFrameCallback(() => { if (!done) { done = true; grab(); } });
+        setTimeout(() => { if (!done) { done = true; grab(); } }, 400); // paused video may never call back
+      } else setTimeout(grab, 150);
+    });
+    v.addEventListener('error', () => finish(null), { once: true });
+    v.src = url;
+    v.play?.()?.catch?.(() => {});
+  });
+}
+async function processVideo(file) {
+  const { thumb, duration } = await videoPoster(file);
+  return { kind: 'video', file, thumb, duration, takenAt: null, gps: null };
+}
+const processFile = f => (isVideoFile(f) ? processVideo(f) : processPhoto(f));
+
 async function processFiles(files) {
   const out = [];
   let failed = 0;
   for (const [i, f] of [...files].entries()) {
-    toast(`Adding photo ${i + 1} of ${files.length}...`, 60000);
+    toast(`Adding ${i + 1} of ${files.length}...`, 60000);
     try { out.push(await processFile(f)); } catch { failed++; }
   }
   $('#toast').hidden = true;
-  if (failed) toast(`${plural(failed, 'photo')} could not be read.`);
+  if (failed) toast(`${plural(failed, 'file')} could not be read.`);
   return out;
+}
+
+// Videos: try to keep the file as a Blob (Safari streams it from disk). Where WebKit refuses
+// Blobs ("Error preparing Blob/File data"), store raw bytes in 8 MB pieces, one write each.
+// Restore passes copyBytes: WebKit saves a *slice* of a File (a video cut out of the backup file)
+// without its start offset, so after a reload it plays the backup's header bytes. Copy instead.
+let blobStoreOk = null;
+async function putVideo(rec, file, copyBytes = false) {
+  if (!copyBytes && blobStoreOk !== false) {
+    try { await DB.put('photos', { ...rec, blob: file }); blobStoreOk = true; return; }
+    catch { blobStoreOk = false; }
+  }
+  const n = Math.max(1, Math.ceil(file.size / CHUNK));
+  for (let i = 0; i < n; i++) {
+    await DB.put('chunks', { id: `${rec.id}:${i}`, data: await file.slice(i * CHUNK, (i + 1) * CHUNK).arrayBuffer() });
+  }
+  await DB.put('photos', { ...rec, chunks: n });
+}
+async function mediaBlob(p) {
+  if (p.blob instanceof Blob) return p.blob;
+  if (p.chunks) {
+    const parts = [];
+    for (let i = 0; i < p.chunks; i++) parts.push((await DB.get('chunks', `${p.id}:${i}`)).data);
+    return new Blob(parts, { type: p.type || 'video/mp4' });
+  }
+  return new Blob([p.data], { type: p.type || 'image/jpeg' });
+}
+async function deleteMedia(p) {
+  for (let i = 0; i < (p.chunks || 0); i++) await DB.del('chunks', `${p.id}:${i}`);
+  await DB.del('photos', p.id);
+}
+async function recount(s) {
+  const all = await DB.photosOf(s.id);
+  s.photoCount = all.length;
+  s.videoCount = all.filter(p => p.kind === 'video').length;
 }
 
 async function attachPhotos(s, processed) {
   const now = Date.now();
-  for (const p of processed) {
-    // Stored as raw bytes, not a Blob: Safari/WebKit can fail with "Error preparing Blob/File data".
-    const rec = { id: uid(), spotId: s.id, data: await p.blob.arrayBuffer(), type: 'image/jpeg', thumb: p.thumb, takenAt: p.takenAt, addedAt: now };
-    await DB.put('photos', rec);
-    if (!s.coverId) { s.coverId = rec.id; s.coverThumb = rec.thumb; }
+  const videoBytes = processed.filter(p => p.kind === 'video').reduce((n, p) => n + p.file.size, 0);
+  if (videoBytes) {
+    try {
+      const e = await navigator.storage?.estimate?.();
+      if (e?.quota && e.quota - e.usage < videoBytes * 1.1) {
+        toast(`Not enough space on this phone for ${(videoBytes / 1048576).toFixed(0)} MB of video.`, 6000);
+        processed = processed.filter(p => p.kind !== 'video');
+      }
+    } catch {}
   }
-  s.photoCount = (s.photoCount || 0) + processed.length;
+  for (const [i, p] of processed.entries()) {
+    const rec = { id: uid(), spotId: s.id, kind: p.kind, thumb: p.thumb || '', takenAt: p.takenAt, addedAt: now + i };
+    if (p.kind === 'video') {
+      if (processed.length > 1 || p.file.size > 40 * 1048576) toast(`Saving video ${(p.file.size / 1048576).toFixed(0)} MB...`, 60000);
+      await putVideo({ ...rec, type: p.file.type || 'video/mp4', duration: p.duration, size: p.file.size }, p.file);
+    } else {
+      // Photos as raw bytes, not a Blob: Safari/WebKit can fail with "Error preparing Blob/File data".
+      await DB.put('photos', { ...rec, type: 'image/jpeg', data: await p.blob.arrayBuffer() });
+    }
+    if (!s.coverId && rec.thumb) { s.coverId = rec.id; s.coverThumb = rec.thumb; }
+  }
+  $('#toast').hidden = true;
+  await recount(s);
   await saveSpot(s);
+  return processed.length;
 }
 
 /* ---------- Spots ---------- */
@@ -386,12 +502,13 @@ async function saveSpot(s) {
   await DB.put('spots', s);
   renderMarker(s);
   askPersist();
+  updateNearest();
 }
 
 async function newSpotAt(latlng, pending = [], name = '') {
   const s = {
     id: uid(), name, notes: '', lat: latlng.lat, lng: latlng.lng,
-    createdAt: Date.now(), updatedAt: Date.now(), coverId: null, coverThumb: null, photoCount: 0,
+    createdAt: Date.now(), updatedAt: Date.now(), coverId: null, coverThumb: null, photoCount: 0, videoCount: 0,
   };
   await saveSpot(s);
   if (pending.length) await attachPhotos(s, pending);
@@ -408,14 +525,15 @@ async function newSpotAt(latlng, pending = [], name = '') {
 }
 
 async function deleteSpot(s) {
-  if (!confirm(`Delete "${s.name || 'Untitled spot'}" and its ${plural(s.photoCount || 0, 'photo')}? This can't be undone.`)) return;
+  if (!confirm(`Delete "${s.name || 'Untitled spot'}" and its ${mediaLabel(s.photoCount, s.videoCount)}? This can't be undone.`)) return;
   readyBackup = null;
-  for (const p of await DB.photosOf(s.id)) await DB.del('photos', p.id);
+  for (const p of await DB.photosOf(s.id)) await deleteMedia(p);
   await DB.del('spots', s.id);
   spots.delete(s.id);
   removeMarker(s.id);
   current = null;
   closeSheet();
+  updateNearest();
   toast('Spot deleted.');
 }
 
@@ -431,12 +549,14 @@ const sheetIsOpen = () => sheet.classList.contains('open');
 
 function openSheet(kind) {
   sheetKind = kind;
+  document.body.classList.add('sheet-open');
   sheet.classList.add('open');
   sheet.setAttribute('aria-hidden', 'false');
   body.scrollTop = 0;
 }
 function closeSheet() {
   sheet.classList.remove('open');
+  document.body.classList.remove('sheet-open');
   sheet.setAttribute('aria-hidden', 'true');
   sheetKind = null;
   if (document.activeElement && sheet.contains(document.activeElement)) document.activeElement.blur();
@@ -473,7 +593,7 @@ async function openSpot(id) {
   current = id;
   refreshSelection(prev);
   const photos = (await DB.photosOf(id)).sort((a, b) => (a.takenAt || a.addedAt) - (b.takenAt || b.addedAt));
-  const meta = [plural(photos.length, 'photo'), `added ${fmtDate(s.createdAt)}`].join(' · ');
+  const meta = [mediaLabel(photos.length, photos.filter(p => p.kind === 'video').length), `added ${fmtDate(s.createdAt)}`].join(' · ');
   body.innerHTML = `
     <div class="sheet-head">
       <textarea id="spotName" class="title" rows="1" placeholder="Name this spot" maxlength="80" aria-label="Spot name" enterkeyhint="done">${esc(s.name)}</textarea>
@@ -481,8 +601,12 @@ async function openSpot(id) {
     </div>
     <p class="meta">${meta}</p>
     <div class="strip">
-      ${photos.map((p, i) => `<button class="tile${p.id === s.coverId ? ' is-cover' : ''}" data-photo="${i}" aria-label="Open photo ${i + 1}"><img src="${esc(p.thumb)}" alt=""></button>`).join('')}
-      <button class="tile tile-add" data-act="addPhotos">${ICON.plus}<span>Add photos</span></button>
+      ${photos.map((p, i) => {
+        const video = p.kind === 'video';
+        const pic = p.thumb ? `<img src="${esc(p.thumb)}" alt="">` : `<span class="tile-icon">${video ? ICON.play : ICON.photo}</span>`;
+        return `<button class="tile${p.id === s.coverId ? ' is-cover' : ''}${video ? ' tile-video' : ''}" data-photo="${i}" aria-label="Open ${video ? 'video' : 'photo'} ${i + 1}">${pic}${video ? `<span class="dur">${ICON.play}${fmtDur(p.duration)}</span>` : ''}</button>`;
+      }).join('')}
+      <button class="tile tile-add" data-act="addPhotos">${ICON.plus}<span>Photo or video</span></button>
     </div>
     <label class="label" for="spotNotes">Notes</label>
     <textarea id="spotNotes" placeholder="Best time for light, parking, crowds, permits, outfit ideas">${esc(s.notes)}</textarea>
@@ -524,7 +648,7 @@ async function openSpot(id) {
 
 function listItem(s) {
   const img = s.coverThumb ? `<img src="${esc(s.coverThumb)}" alt="">` : `<span class="noimg">${ICON.photo}</span>`;
-  const sub = [plural(s.photoCount || 0, 'photo'), s.notes ? s.notes.replace(/\s+/g, ' ').slice(0, 60) : ''].filter(Boolean).join(' · ');
+  const sub = [mediaLabel(+s.photoCount || 0, +s.videoCount || 0), s.notes ? s.notes.replace(/\s+/g, ' ').slice(0, 60) : ''].filter(Boolean).join(' · ');
   return `<button class="item" data-spot="${esc(s.id)}">${img}<span><b>${esc(s.name || 'Untitled spot')}</b><small>${esc(sub)}</small></span></button>`;
 }
 
@@ -573,7 +697,8 @@ async function runPlaceSearch(q) {
 }
 
 async function openMenu() {
-  const photos = [...spots.values()].reduce((n, s) => n + (+s.photoCount || 0), 0);
+  const total = [...spots.values()].reduce((n, s) => n + (+s.photoCount || 0), 0);
+  const videos = [...spots.values()].reduce((n, s) => n + (+s.videoCount || 0), 0);
   let used = '';
   try {
     const e = await navigator.storage?.estimate?.();
@@ -587,8 +712,8 @@ async function openMenu() {
       <h2>Backup &amp; storage</h2>
       <button class="icon-btn" data-act="close" aria-label="Close">${ICON.x}</button>
     </div>
-    <p class="meta">${esc([plural(spots.size, 'spot'), plural(photos, 'photo'), used].filter(Boolean).join(' · '))}</p>
-    <p class="note">Everything is saved on this phone only. Nothing is uploaded. Make a backup now and then so you never lose your spots.</p>
+    <p class="meta">${esc([plural(spots.size, 'spot'), mediaLabel(total, videos), used].filter(Boolean).join(' · '))}</p>
+    <p class="note">Everything is saved on this phone only. Nothing is uploaded. Make a backup now and then so you never lose your spots. Videos make the backup file big.</p>
     <div class="rows">
       <button class="row" data-act="export">Save a backup <span>to Files or iCloud Drive</span></button>
       <button class="row" data-act="import">Restore from a backup</button>
@@ -602,24 +727,39 @@ async function openMenu() {
   openSheet('menu');
 }
 
-/* ---------- Viewer ---------- */
+/* ---------- Viewer (photos + videos) ---------- */
 let vState = null;
 function openViewer(s, photos, i) {
-  vState = { s, photos, i, url: null };
+  vState = { s, photos, i, url: null, blob: null };
   $('#viewer').hidden = false;
   showPhoto();
 }
-function showPhoto() {
-  const { photos, i } = vState;
-  const p = photos[i];
-  if (vState.url) URL.revokeObjectURL(vState.url);
-  vState.url = URL.createObjectURL(photoBlob(p));
-  $('#vImg').src = vState.url;
-  $('#vCount').textContent = `${i + 1} / ${photos.length}`;
+async function showPhoto() {
+  const st = vState;
+  if (!st) return;
+  const p = st.photos[st.i];
+  const img = $('#vImg'), vid = $('#vVid');
+  vid.pause();
+  $('#vCount').textContent = `${st.i + 1} / ${st.photos.length}`;
   $('#vDate').textContent = p.takenAt ? `Taken ${fmtDate(p.takenAt)}` : `Added ${fmtDate(p.addedAt)}`;
-  $('#vCover').textContent = p.id === vState.s.coverId ? 'Cover photo' : 'Make cover';
+  $('#vCover').hidden = !p.thumb;
+  $('#vCover').textContent = p.id === st.s.coverId ? 'Cover' : 'Make cover';
+  const blob = await mediaBlob(p);
+  if (vState !== st || st.photos[st.i] !== p) return; // moved on while loading
+  if (st.url) URL.revokeObjectURL(st.url);
+  st.blob = blob; // kept ready so Share can open the sheet right on the tap
+  st.url = URL.createObjectURL(blob);
+  if (p.kind === 'video') {
+    img.hidden = true; img.removeAttribute('src');
+    vid.hidden = false; vid.src = st.url;
+  } else {
+    vid.hidden = true; vid.removeAttribute('src'); vid.load();
+    img.hidden = false; img.src = st.url;
+  }
 }
 function closeViewer() {
+  const vid = $('#vVid');
+  vid.pause(); vid.removeAttribute('src'); vid.load();
   if (vState?.url) URL.revokeObjectURL(vState.url);
   vState = null;
   $('#viewer').hidden = true;
@@ -632,15 +772,17 @@ function step(d) {
   showPhoto();
 }
 (() => {
-  let x0 = null;
-  const img = $('#vImg');
-  img.addEventListener('touchstart', e => { x0 = e.touches[0].clientX; }, { passive: true });
-  img.addEventListener('touchend', e => {
-    if (x0 == null) return;
-    const dx = e.changedTouches[0].clientX - x0;
-    x0 = null;
-    if (Math.abs(dx) > 50) step(dx < 0 ? 1 : -1);
-  });
+  let x0 = null, y0 = null;
+  const img = $('#vImg'), vid = $('#vVid');
+  for (const el of [img, vid]) {
+    el.addEventListener('touchstart', e => { x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; }, { passive: true });
+    el.addEventListener('touchend', e => {
+      if (x0 == null) return;
+      const dx = e.changedTouches[0].clientX - x0, dy = e.changedTouches[0].clientY - y0;
+      x0 = null;
+      if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) step(dx < 0 ? 1 : -1);
+    });
+  }
   img.addEventListener('click', e => { step(e.clientX > window.innerWidth / 2 ? 1 : -1); });
   $('#vClose').addEventListener('click', closeViewer);
   document.addEventListener('keydown', e => {
@@ -650,33 +792,40 @@ function step(d) {
     if (e.key === 'ArrowLeft') step(-1);
   });
   $('#vShare').addEventListener('click', async () => {
-    const p = vState.photos[vState.i];
-    const file = new File([photoBlob(p)], `${(vState.s.name || 'spot').replace(/[^\w-]+/g, '-')}-${vState.i + 1}.jpg`, { type: 'image/jpeg' });
+    const st = vState;
+    if (!st?.blob) return;
+    const p = st.photos[st.i];
+    const ext = p.kind === 'video' ? (/quicktime/.test(st.blob.type) ? 'mov' : /webm/.test(st.blob.type) ? 'webm' : 'mp4') : 'jpg';
+    const file = new File([st.blob], `${(st.s.name || 'spot').replace(/[^\w-]+/g, '-')}-${st.i + 1}.${ext}`, { type: st.blob.type || (p.kind === 'video' ? 'video/mp4' : 'image/jpeg') });
     if (navigator.canShare?.({ files: [file] })) {
       try { await navigator.share({ files: [file] }); } catch {}
     } else {
       const a = document.createElement('a');
-      a.href = vState.url; a.download = file.name; a.click();
+      a.href = st.url; a.download = file.name; a.click();
     }
   });
   $('#vCover').addEventListener('click', async () => {
     const p = vState.photos[vState.i];
+    if (!p.thumb) return;
     const s = spots.get(vState.s.id);
     s.coverId = p.id; s.coverThumb = p.thumb;
     vState.s = s;
     await saveSpot(s);
-    showPhoto();
-    toast('Cover photo set.', 1500);
+    $('#vCover').textContent = 'Cover';
+    toast('Cover set.', 1500);
   });
   $('#vDel').addEventListener('click', async () => {
-    if (!confirm('Delete this photo?')) return;
     const { photos, i } = vState;
     const p = photos[i];
+    if (!confirm(`Delete this ${p.kind === 'video' ? 'video' : 'photo'}?`)) return;
     const s = spots.get(vState.s.id);
-    await DB.del('photos', p.id);
+    await deleteMedia(p);
     photos.splice(i, 1);
-    s.photoCount = photos.length;
-    if (s.coverId === p.id) { s.coverId = photos[0]?.id || null; s.coverThumb = photos[0]?.thumb || null; }
+    if (s.coverId === p.id) {
+      const next = photos.find(x => x.thumb);
+      s.coverId = next?.id || null; s.coverThumb = next?.thumb || null;
+    }
+    await recount(s);
     await saveSpot(s);
     if (!photos.length) { closeViewer(); }
     else { vState.s = s; vState.i = Math.min(i, photos.length - 1); showPhoto(); }
@@ -694,7 +843,7 @@ function startPlacing(mode, spotId = null, at = null) {
   $('#pPhoto').hidden = mode === 'move';
   $('#placeHint').textContent = mode === 'move'
     ? 'Move the map so the cross sits on the new spot, then tap Set here.'
-    : 'Move the map so the cross sits on the spot. Or pick a photo and it jumps to where it was taken.';
+    : 'Move the map so the cross sits on the spot. Or pick a photo or video to add (photos with a location jump the map there).';
   const target = at || (spotId && spots.get(spotId) && [spots.get(spotId).lat, spots.get(spotId).lng]);
   if (target) goTo(target[0], target[1]);
 }
@@ -713,11 +862,16 @@ window.addEventListener('unhandledrejection', e => {
   toast('Something went wrong saving that. Try again. If it keeps happening, make a backup from the ... menu.', 6000);
 });
 
+// Photos/videos still being read when Set here is tapped must not get lost: wait for them.
+let filesBusy = null;
 $('#pSet').addEventListener('click', async () => {
   if (!placing) return;
   const c = map.getCenter();
-  const { mode, spotId, pending, name } = placing;
+  const pl = placing;
+  const { mode, spotId, name } = pl;
   stopPlacing();
+  if (filesBusy) { toast('Finishing your photos and videos...', 60000); await filesBusy; $('#toast').hidden = true; }
+  const pending = pl.pending;
   if (mode === 'move') {
     const s = spots.get(spotId);
     s.lat = c.lat; s.lng = c.lng;
@@ -741,45 +895,60 @@ $('#filePhotos').addEventListener('change', async e => {
   const target = fileTarget;
   fileTarget = null;
   if (!files.length || !target) return;
-  const processed = await processFiles(files);
+  const pl = target.type === 'placing' ? placing : null;
+  const job = processFiles(files);
+  filesBusy = job;
+  const processed = await job;
+  if (filesBusy === job) filesBusy = null;
   if (!processed.length) return;
-  if (target.type === 'placing' && placing) {
-    placing.pending.push(...processed);
+  if (pl) {
+    pl.pending.push(...processed);
+    if (placing !== pl) return; // Set here was already tapped; it picks these up
+    const ready = mediaLabel(pl.pending.length, pl.pending.filter(p => p.kind === 'video').length);
     const g = processed.find(p => p.gps)?.gps;
     if (g) {
       goTo(g.latitude, g.longitude, 18);
-      $('#placeHint').textContent = `${plural(placing.pending.length, 'photo')} ready. Jumped to where it was taken. Fine-tune, then Set here.`;
+      $('#placeHint').textContent = `${ready} ready. Jumped to where the photo was taken. Fine-tune, then Set here.`;
+    } else if (processed.every(p => p.kind === 'video')) {
+      $('#placeHint').textContent = `${ready} ready. iPhone doesn't share a video's location with web apps, so tap My location or move the map, then Set here.`;
     } else {
-      $('#placeHint').textContent = `${plural(placing.pending.length, 'photo')} ready, but no location inside. Next time tap Options > Location when picking. Move the map to the spot, then Set here.`;
+      $('#placeHint').textContent = `${ready} ready, but no location inside. Next time tap Options > Location when picking. Tap My location or move the map, then Set here.`;
     }
   } else if (target.type === 'spot') {
     const s = spots.get(target.id);
     if (!s) return;
-    await attachPhotos(s, processed);
+    const n = await attachPhotos(s, processed);
     await openSpot(s.id);
-    toast(`${plural(processed.length, 'photo')} added.`, 1800);
+    if (n) toast(`${mediaLabel(n, processed.filter(p => p.kind === 'video').length)} added.`, 1800);
   }
 });
 
 const blobToDataURL = b => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(b); });
 const dataURLToBlob = async u => (await fetch(u)).blob();
-// Photos saved before 2026-10-17 v2 may still hold a Blob.
-const photoBlob = p => (p.blob instanceof Blob ? p.blob : new Blob([p.data], { type: p.type || 'image/jpeg' }));
 
+/* Backup file (.spots): "SPOTS2\n" + 12-digit header length + "\n" + JSON header + raw media bytes.
+   Built from Blob parts, so big videos are never copied into memory or turned into text. */
+const MAGIC = 'SPOTS2\n';
 // Two taps on purpose: iPhone only opens the share sheet right after a tap,
-// and packing many photos takes longer than that. Tap 1 packs, tap 2 shares.
+// and packing takes longer than that. Tap 1 packs, tap 2 shares.
 let readyBackup = null;
 async function exportBackup() {
   const row = body.querySelector('[data-act="export"]');
   if (readyBackup) return saveBackupFile(readyBackup);
-  if (row) row.innerHTML = 'Packing backup... <span>photos included</span>';
+  if (row) row.innerHTML = 'Packing backup... <span>photos and videos included</span>';
   try {
-    const photos = await DB.all('photos');
-    const out = [];
-    for (const { data, blob, ...p } of photos) out.push({ ...p, blob: await blobToDataURL(photoBlob({ data, blob })) });
-    const json = JSON.stringify({ app: 'spot-map', version: 1, exportedAt: new Date().toISOString(), spots: [...spots.values()], photos: out });
-    const name = `spots-backup-${new Date().toISOString().slice(0, 10)}.json`;
-    readyBackup = new File([json], name, { type: 'application/json' });
+    const parts = [], media = [];
+    let offset = 0;
+    for (const rec of await DB.all('photos')) {
+      const b = await mediaBlob(rec);
+      const { data, blob, chunks, ...meta } = rec;
+      media.push({ ...meta, kind: meta.kind || 'photo', type: b.type || meta.type, offset, size: b.size });
+      parts.push(b);
+      offset += b.size;
+    }
+    const header = new TextEncoder().encode(JSON.stringify({ app: 'spot-map', version: 2, exportedAt: new Date().toISOString(), spots: [...spots.values()], media }));
+    const name = `spots-backup-${new Date().toISOString().slice(0, 10)}.spots`;
+    readyBackup = new File([MAGIC, String(header.length).padStart(12, '0'), '\n', header, ...parts], name, { type: 'application/octet-stream' });
     if (row && row.isConnected) row.innerHTML = `Backup ready, tap to save <span>${(readyBackup.size / 1048576).toFixed(1)} MB</span>`;
   } catch {
     readyBackup = null;
@@ -802,47 +971,121 @@ async function saveBackupFile(file) {
   if (sheetKind === 'menu') openMenu();
 }
 
+// Restore. A backup file is untrusted input: every record is rebuilt from typed, allowed fields.
 $('#fileImport').addEventListener('change', async e => {
   const f = e.target.files[0];
   e.target.value = '';
   if (!f) return;
+  const str = (v, max) => String(v ?? '').slice(0, max);
+  const num = v => (Number.isFinite(+v) ? +v : 0);
+  const isId = v => typeof v === 'string' && /^[\w-]{1,64}$/.test(v);
+  const isImg = v => typeof v === 'string' && /^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(v);
   try {
-    const data = JSON.parse(await f.text());
+    let data, items; // items: [{ meta, getBlob }]
+    const head = new TextDecoder().decode(await f.slice(0, 20).arrayBuffer());
+    if (head.startsWith(MAGIC)) {
+      const len = parseInt(head.slice(7, 19), 10);
+      if (!(len > 0 && 20 + len <= f.size)) throw new Error('bad header');
+      data = JSON.parse(await f.slice(20, 20 + len).text());
+      const start = 20 + len;
+      items = (data.media || []).map(m => ({
+        meta: m,
+        getBlob: () => {
+          const o = num(m.offset), n = num(m.size);
+          if (o < 0 || n <= 0 || start + o + n > f.size) throw new Error('bad media range');
+          return f.slice(start + o, start + o + n, /^(image|video)\/[\w.+-]+$/.test(m.type) ? m.type : '');
+        },
+      }));
+    } else {
+      data = JSON.parse(await f.text()); // version 1 backups (photos as text)
+      items = (data.photos || []).map(p => ({ meta: { ...p, kind: 'photo' }, getBlob: () => { if (!isImg(p.blob)) throw new Error('bad photo'); return dataURLToBlob(p.blob); } }));
+    }
     if (data.app !== 'spot-map' || !Array.isArray(data.spots)) throw new Error('not a backup');
-    let ns = 0, np = 0;
-    // Rebuild every record from typed, allowed fields only (a backup file is untrusted input).
-    const str = (v, max) => String(v ?? '').slice(0, max);
-    const num = v => (Number.isFinite(+v) ? +v : 0);
-    const isImg = v => typeof v === 'string' && /^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(v);
+    toast('Restoring...', 60000);
+    let ns = 0, np = 0, nv = 0;
+    const touched = new Set();
     for (const raw of data.spots) {
-      if (typeof raw.id !== 'string' || !/^[\w-]{1,64}$/.test(raw.id) || spots.has(raw.id)) continue;
+      if (!isId(raw.id) || spots.has(raw.id)) continue;
       const lat = +raw.lat, lng = +raw.lng;
       if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) continue;
       const s = {
         id: raw.id, name: str(raw.name, 80), notes: str(raw.notes, 5000), lat, lng,
         createdAt: num(raw.createdAt) || Date.now(), updatedAt: num(raw.updatedAt) || Date.now(),
-        coverId: typeof raw.coverId === 'string' ? raw.coverId.slice(0, 64) : null,
+        coverId: isId(raw.coverId) ? raw.coverId : null,
         coverThumb: isImg(raw.coverThumb) ? raw.coverThumb : null,
-        photoCount: Math.max(0, Math.floor(num(raw.photoCount))),
+        photoCount: 0, videoCount: 0,
       };
-      await DB.put('spots', s); spots.set(s.id, s); renderMarker(s); ns++;
+      await DB.put('spots', s); spots.set(s.id, s); touched.add(s.id); ns++;
     }
-    for (const p of data.photos || []) {
-      if (typeof p.id !== 'string' || !/^[\w-]{1,64}$/.test(p.id) || typeof p.spotId !== 'string' || !isImg(p.blob)) continue;
-      if (await DB.get('photos', p.id)) continue;
-      const b = await dataURLToBlob(p.blob);
-      await DB.put('photos', {
-        id: p.id, spotId: p.spotId.slice(0, 64), data: await b.arrayBuffer(), type: b.type || 'image/jpeg',
-        thumb: isImg(p.thumb) ? p.thumb : '', takenAt: num(p.takenAt) || null, addedAt: num(p.addedAt) || Date.now(),
-      }); np++;
+    for (const { meta: m, getBlob } of items) {
+      if (!isId(m.id) || !isId(m.spotId) || !spots.has(m.spotId)) continue;
+      if (await DB.get('photos', m.id)) continue;
+      let b;
+      try { b = await getBlob(); } catch { continue; }
+      const video = m.kind === 'video';
+      if (!(video ? /^video\//.test(b.type) : /^image\//.test(b.type || 'image/jpeg'))) continue;
+      const rec = { id: m.id, spotId: m.spotId, kind: video ? 'video' : 'photo', thumb: isImg(m.thumb) ? m.thumb : '', takenAt: num(m.takenAt) || null, addedAt: num(m.addedAt) || Date.now() };
+      if (video) await putVideo({ ...rec, type: b.type, duration: num(m.duration), size: b.size }, b, true);
+      else await DB.put('photos', { ...rec, type: b.type || 'image/jpeg', data: await b.arrayBuffer() });
+      touched.add(m.spotId); np++; if (video) nv++;
     }
+    for (const id of touched) { const s = spots.get(id); await recount(s); await DB.put('spots', s); renderMarker(s); }
     readyBackup = null;
-    toast(`Restored ${plural(ns, 'spot')} and ${plural(np, 'photo')}.`);
+    updateNearest();
+    toast(`Restored ${plural(ns, 'spot')} and ${mediaLabel(np, nv)}.`);
     if (sheetKind === 'menu') openMenu();
   } catch {
     toast('That file is not a Spots backup.');
   }
 });
+
+/* ---------- You + the nearest spot ---------- */
+let myPos = null, watchId = null, nearestKey = '';
+function placeMe(lat, lng) {
+  if (!meDot) {
+    const el = document.createElement('div');
+    el.className = 'me-dot';
+    meDot = new maplibregl.Marker({ element: el }).setLngLat(ll(lat, lng)).addTo(map);
+  } else meDot.setLngLat(ll(lat, lng));
+}
+function startWatch() {
+  if (watchId != null || !navigator.geolocation) return;
+  watchId = navigator.geolocation.watchPosition(p => {
+    myPos = { lat: p.coords.latitude, lng: p.coords.longitude };
+    placeMe(myPos.lat, myPos.lng);
+    updateNearest();
+  }, err => {
+    if (err.code === 1) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+  }, { enableHighAccuracy: true, maximumAge: 10000, timeout: 30000 });
+}
+function metersBetween(a, b) {
+  const R = 6371000, r = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * r, dLng = (b.lng - a.lng) * r;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+const fmtDist = m => (m < 160 ? `${Math.round(m * 3.281 / 10) * 10 || 10} ft away` : `${(m / 1609.34).toFixed(m < 16093 ? 1 : 0)} mi away`);
+async function updateNearest() {
+  const card = $('#nearest');
+  if (!myPos || !spots.size) { card.hidden = true; document.body.classList.remove('has-nearest'); return; }
+  let best = null, bestD = Infinity;
+  for (const s of spots.values()) { const d = metersBetween(myPos, s); if (d < bestD) { bestD = d; best = s; } }
+  card.hidden = false;
+  document.body.classList.add('has-nearest');
+  card.dataset.spot = best.id;
+  $('#nDist').textContent = `Nearest spot · ${fmtDist(bestD)}`;
+  $('#nName').textContent = best.name || 'Untitled spot';
+  const key = `${best.id}:${best.updatedAt}`;
+  if (key === nearestKey) return;
+  nearestKey = key;
+  const media = (await DB.photosOf(best.id)).sort((a, b) => (a.takenAt || a.addedAt) - (b.takenAt || b.addedAt));
+  if (nearestKey !== key) return;
+  const shown = media.filter(p => p.thumb).slice(0, 2);
+  $('#nThumbs').innerHTML = shown.map(p => `<span class="n-thumb${p.kind === 'video' ? ' is-video' : ''}"><img src="${esc(p.thumb)}" alt="">${p.kind === 'video' ? ICON.play : ''}</span>`).join('')
+    + (media.length > shown.length ? `<span class="n-more">+${media.length - shown.length}</span>` : '');
+  $('#nName').title = mediaLabel(media.length, media.filter(p => p.kind === 'video').length);
+}
+$('#nearest').addEventListener('click', () => { const id = $('#nearest').dataset.spot; if (id && !placing) openSpot(id); });
 
 /* ---------- Wiring ---------- */
 $('#btnAdd').addEventListener('click', () => startPlacing('new'));
@@ -875,6 +1118,7 @@ async function boot() {
     spots.forEach(s => b.extend(ll(s.lat, s.lng)));
     map.fitBounds(b, { padding: 90, maxZoom: 15, duration: 0 });
   }
+  startWatch(); // live blue dot; iPhone asks for location the first time
   if (spots.size) askPersist();
   else toast('Tap Add spot, or press and hold anywhere on the map, to save your first spot.', 6000);
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://tiles.openfreemap.org https://server.arcgisonline.com; connect-src 'self' data: blob: https://tiles.openfreemap.org https://server.arcgisonline.com https://photon.komoot.io https://nominatim.openstreetmap.org; worker-src 'self' blob:; child-src blob:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://tiles.openfreemap.org https://server.arcgisonline.com; connect-src 'self' data: blob: https://tiles.openfreemap.org https://server.arcgisonline.com https://photon.komoot.io https://nominatim.openstreetmap.org; worker-src 'self' blob:; media-src 'self' blob:; child-src blob:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
@@ -43,6 +43,11 @@
   </button>
 </div>
 
+<button id="nearest" class="nearest" hidden>
+  <span class="n-text"><small id="nDist"></small><b id="nName"></b></span>
+  <span id="nThumbs" class="n-thumbs"></span>
+</button>
+
 <button id="btnAdd" class="add-btn">
   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
   Add spot
@@ -71,6 +76,7 @@
     <button id="vShare" class="v-btn">Share</button>
   </div>
   <img id="vImg" alt="">
+  <video id="vVid" controls playsinline preload="metadata" hidden></video>
   <div class="v-bottom">
     <span id="vDate" class="v-date"></span>
     <div>
@@ -82,8 +88,8 @@
 
 <div id="toast" class="toast" role="status" hidden></div>
 
-<input type="file" id="filePhotos" accept="image/*" multiple hidden>
-<input type="file" id="fileImport" accept="application/json,.json" hidden>
+<input type="file" id="filePhotos" accept="image/*,video/*" multiple hidden>
+<input type="file" id="fileImport" hidden>
 
 <script src="vendor/maplibre/maplibre-gl.js"></script>
 <script src="vendor/exifr/lite.umd.js"></script>

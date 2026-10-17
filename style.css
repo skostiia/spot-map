@@ -206,3 +206,33 @@ textarea:not(.title):focus { border-color: var(--body); }
 @media (prefers-reduced-motion: reduce) {
   .sheet, .pin, .icon-btn { transition: none; }
 }
+
+/* Videos in the strip + viewer */
+.tile { position: relative; }
+.tile-icon { display: grid; place-items: center; width: 100%; height: 100%; color: var(--body); }
+.dur {
+  position: absolute; left: 6px; bottom: 6px; display: flex; align-items: center; gap: 3px;
+  padding: 2px 6px 2px 4px; border-radius: 4px; background: oklch(0 0 0 / 0.6);
+  font-size: 11px; font-weight: 600; color: oklch(0.98 0 0);
+}
+.dur svg { width: 11px; height: 11px; }
+.viewer video { flex: 1; min-height: 0; width: 100%; background: #000; }
+
+/* Nearest spot to you */
+.nearest {
+  position: fixed; z-index: var(--z-map-ui); left: 12px; right: 12px; bottom: calc(var(--safe-b) + 90px);
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 64px; padding: 8px 8px 8px 14px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); text-align: left;
+}
+.nearest:active { opacity: .7; }
+.n-text { min-width: 0; }
+.n-text { flex: 1; }
+.n-text small { display: block; font-size: var(--t-small); color: var(--body); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.n-text b { display: block; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.n-thumbs { display: flex; gap: 4px; flex: none; }
+.n-thumb { position: relative; width: 44px; height: 44px; border-radius: 6px; overflow: hidden; background: var(--surface-2); }
+.n-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.n-thumb svg { position: absolute; inset: 0; margin: auto; width: 16px; height: 16px; color: oklch(0.98 0 0); filter: drop-shadow(0 1px 2px oklch(0 0 0 / 0.6)); }
+.n-more { display: grid; place-items: center; min-width: 34px; height: 44px; padding: 0 6px; border-radius: 6px; background: var(--surface-2); color: var(--body); font-size: var(--t-small); }
+body.has-nearest .map-controls { bottom: calc(var(--safe-b) + 166px); }
+body.sheet-open .nearest, body.placing .nearest { display: none; }
