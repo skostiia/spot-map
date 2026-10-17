@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="Spots">
+<meta name="theme-color" content="#0E1013">
+<meta name="description" content="Your own map of shoot locations, with your photos and notes on every spot.">
+<title>Spots</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<link rel="stylesheet" href="vendor/maplibre/maplibre-gl.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="map" aria-label="Map of your spots"></div>
+
+<header class="topbar">
+  <label class="search">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>
+    <input id="q" type="search" placeholder="Search spots or places" autocomplete="off" enterkeyhint="search" aria-label="Search">
+  </label>
+  <button id="btnList" class="icon-btn" aria-label="All spots">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/></svg>
+  </button>
+  <button id="btnMenu" class="icon-btn" aria-label="Backup and storage">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/></svg>
+  </button>
+</header>
+
+<div class="map-controls">
+  <button id="btn3d" class="icon-btn" aria-label="Tilt map to 3D" aria-pressed="false"><span class="icon-label">3D</span></button>
+  <button id="btnLayer" class="icon-btn" aria-label="Switch map and satellite" aria-pressed="false">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 13l9 5 9-5"/></svg>
+  </button>
+  <button id="btnLocate" class="icon-btn" aria-label="Go to my location">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 3L3 10.5l7.5 3 3 7.5L21 3z"/></svg>
+  </button>
+</div>
+
+<button id="btnAdd" class="add-btn">
+  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+  Add spot
+</button>
+
+<div id="crosshair" class="crosshair" hidden aria-hidden="true"></div>
+<div id="placeBar" class="place-bar" hidden>
+  <p id="placeHint" class="place-hint">Move the map so the cross sits on the spot</p>
+  <div class="place-actions">
+    <button id="pMe" class="btn">My location</button>
+    <button id="pPhoto" class="btn">From a photo</button>
+    <button id="pCancel" class="btn">Cancel</button>
+    <button id="pSet" class="btn btn-primary">Set here</button>
+  </div>
+</div>
+
+<section id="sheet" class="sheet" aria-hidden="true">
+  <div class="grab" id="grab"><span></span></div>
+  <div id="sheetBody" class="sheet-body"></div>
+</section>
+
+<div id="viewer" class="viewer" hidden>
+  <div class="v-top">
+    <button id="vClose" class="v-btn">Close</button>
+    <span id="vCount" class="v-count"></span>
+    <button id="vShare" class="v-btn">Share</button>
+  </div>
+  <img id="vImg" alt="">
+  <div class="v-bottom">
+    <span id="vDate" class="v-date"></span>
+    <div>
+      <button id="vCover" class="v-btn">Make cover</button>
+      <button id="vDel" class="v-btn">Delete</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" hidden></div>
+
+<input type="file" id="filePhotos" accept="image/*" multiple hidden>
+<input type="file" id="fileImport" accept="application/json,.json" hidden>
+
+<script src="vendor/maplibre/maplibre-gl.js"></script>
+<script src="vendor/exifr/lite.umd.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
