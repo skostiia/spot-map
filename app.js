@@ -176,6 +176,7 @@ function initMap() {
     sync3dButton();
   });
   map.on('click', () => { if (!placing && sheetIsOpen()) closeSheet(); });
+  map.on('dragstart', () => { userMovedMap = true; });
 
   // Press and hold on the map = new spot there (right-click on a computer).
   let holdTimer = null, holdStart = null, lastHold = 0;
@@ -278,13 +279,15 @@ function locate(fly = true) {
       placeMe(lat, lng);
       if (fly) goTo(lat, lng);
       myPos = { lat, lng };
+      myAcc = p.coords.accuracy || myAcc;
+      $('#btnLocate').classList.remove('blocked');
+      placeMe(lat, lng);
       updateNearest();
       startWatch();
       res([lat, lng]);
     }, err => {
-      toast(err.code === 1
-        ? 'Location is blocked. iPhone Settings > Privacy & Security > Location Services > Safari Websites > While Using the App.'
-        : 'Could not get your location. Try again in a second.', 6000);
+      if (err.code === 1) locationBlocked();
+      else toast('Could not get your location yet. Step outside or wait a few seconds, then tap again.', 5000);
       res(null);
     }, { enableHighAccuracy: true, timeout: 12000, maximumAge: 30000 });
   });
@@ -1042,21 +1045,47 @@ $('#fileImport').addEventListener('change', async e => {
 
 /* ---------- You + the nearest spot ---------- */
 let myPos = null, watchId = null, nearestKey = '';
+// You: blue dot + a ring showing how accurate the fix is (real size on the map).
+let myAcc = 0, flewToMe = false, userMovedMap = false;
+function sizeAccuracy() {
+  if (!meDot || !myPos) return;
+  const mPerPx = 40075016.686 * Math.cos(myPos.lat * Math.PI / 180) / (512 * 2 ** map.getZoom());
+  const d = Math.min(600, Math.max(0, (2 * myAcc) / mPerPx));
+  const ring = meDot.getElement().querySelector('.me-acc');
+  ring.style.width = ring.style.height = `${d}px`;
+  ring.style.opacity = d > 30 ? '1' : '0';
+}
 function placeMe(lat, lng) {
   if (!meDot) {
     const el = document.createElement('div');
-    el.className = 'me-dot';
-    meDot = new maplibregl.Marker({ element: el }).setLngLat(ll(lat, lng)).addTo(map);
+    el.className = 'me';
+    el.innerHTML = '<span class="me-acc"></span><span class="me-pulse"></span><span class="me-dot"></span>';
+    el.setAttribute('aria-label', 'You are here');
+    meDot = new maplibregl.Marker({ element: el, anchor: 'center' }).setLngLat(ll(lat, lng)).addTo(map);
+    el.style.zIndex = 5;
+    map.on('zoom', sizeAccuracy);
   } else meDot.setLngLat(ll(lat, lng));
+  sizeAccuracy();
+}
+function locationBlocked() {
+  $('#btnLocate').classList.add('blocked');
+  toast('Location is off for Spots. On your iPhone: Settings > Privacy & Security > Location Services (on) > Safari Websites > While Using the App. Then close and reopen Spots.', 10000);
 }
 function startWatch() {
   if (watchId != null || !navigator.geolocation) return;
   watchId = navigator.geolocation.watchPosition(p => {
     myPos = { lat: p.coords.latitude, lng: p.coords.longitude };
+    myAcc = p.coords.accuracy || 0;
+    $('#btnLocate').classList.remove('blocked');
     placeMe(myPos.lat, myPos.lng);
+    // First fix after opening: go to you, unless you already moved the map yourself.
+    if (!flewToMe && !userMovedMap && !placing && !sheetIsOpen()) {
+      flewToMe = true;
+      map.flyTo({ center: ll(myPos.lat, myPos.lng), zoom: Math.max(map.getZoom(), 15), duration: 900 });
+    }
     updateNearest();
   }, err => {
-    if (err.code === 1) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+    if (err.code === 1) { navigator.geolocation.clearWatch(watchId); watchId = null; locationBlocked(); }
   }, { enableHighAccuracy: true, maximumAge: 10000, timeout: 30000 });
 }
 function metersBetween(a, b) {

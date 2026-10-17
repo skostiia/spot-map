@@ -1,5 +1,5 @@
 // Offline: the app shell is cached; map tiles are cached as you browse (capped).
-const SHELL = 'spots-shell-v8';
+const SHELL = 'spots-shell-v10';
 const TILES = 'spots-tiles-v2';
 const TILE_CAP = 1500;
 const FILES = [
@@ -23,34 +23,49 @@ async function trimTiles() {
   for (let i = 0; i < keys.length - TILE_CAP; i++) await c.delete(keys[i]);
 }
 
+// Background cache writes go through e.waitUntil so the browser keeps them alive properly
+// (fire-and-forget writes made WebKit hang the first reload after the worker took over).
+const keep = (e, p) => e.waitUntil(p.catch(() => {}));
+
 self.addEventListener('fetch', e => {
-  const url = new URL(e.request.url);
-  if (e.request.method !== 'GET') return;
+  const req = e.request;
+  if (req.method !== 'GET') return;
+  const url = new URL(req.url);
   if (url.origin === location.origin) {
-    // Network first so updates land, cache when offline.
-    e.respondWith(fetch(e.request).then(r => {
-      const copy = r.clone();
-      caches.open(SHELL).then(c => c.put(e.request, copy));
-      return r;
-    }).catch(() => caches.match(e.request, { ignoreSearch: true }).then(r => r || caches.match('index.html'))));
+    // Network first so updates land; cached copy when offline.
+    e.respondWith((async () => {
+      try {
+        const r = await fetch(req);
+        if (r.ok) { const copy = r.clone(); keep(e, caches.open(SHELL).then(c => c.put(req, copy))); }
+        return r;
+      } catch {
+        const hit = await caches.match(req, { ignoreSearch: true });
+        if (hit) return hit;
+        if (req.mode === 'navigate') return (await caches.match('index.html')) || Response.error();
+        return Response.error();
+      }
+    })());
     return;
   }
   // Map style + TileJSON change weekly (they point at the newest tiles): network first.
   if (url.hostname === 'tiles.openfreemap.org' && !/\.(pbf|png|jpg|webp)$/.test(url.pathname)) {
-    e.respondWith(fetch(e.request).then(r => {
-      const copy = r.clone();
-      caches.open(TILES).then(c => c.put(e.request, copy));
-      return r;
-    }).catch(() => caches.match(e.request)));
+    e.respondWith((async () => {
+      try {
+        const r = await fetch(req);
+        if (r.ok) { const copy = r.clone(); keep(e, caches.open(TILES).then(c => c.put(req, copy))); }
+        return r;
+      } catch { return (await caches.match(req)) || Response.error(); }
+    })());
     return;
   }
   if (/tiles\.openfreemap\.org|arcgisonline\.com/.test(url.hostname)) {
-    e.respondWith(caches.open(TILES).then(async c => {
-      const hit = await c.match(e.request);
+    e.respondWith((async () => {
+      const c = await caches.open(TILES);
+      const hit = await c.match(req);
       if (hit) return hit;
-      const r = await fetch(e.request);
-      if (r.ok || r.type === 'opaque') { c.put(e.request, r.clone()); trimTiles(); }
+      const r = await fetch(req);
+      if (r.ok || r.type === 'opaque') { const copy = r.clone(); keep(e, c.put(req, copy).then(trimTiles)); }
       return r;
-    }));
+    })());
   }
 });
