@@ -1,5 +1,5 @@
 // Offline: the app shell is cached; map tiles are cached as you browse (capped).
-const SHELL = 'spots-shell-v5';
+const SHELL = 'spots-shell-v6';
 const TILES = 'spots-tiles-v2';
 const TILE_CAP = 1500;
 const FILES = [

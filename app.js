@@ -573,7 +573,7 @@ async function runPlaceSearch(q) {
 }
 
 async function openMenu() {
-  const photos = [...spots.values()].reduce((n, s) => n + (s.photoCount || 0), 0);
+  const photos = [...spots.values()].reduce((n, s) => n + (+s.photoCount || 0), 0);
   let used = '';
   try {
     const e = await navigator.storage?.estimate?.();
@@ -587,7 +587,7 @@ async function openMenu() {
       <h2>Backup &amp; storage</h2>
       <button class="icon-btn" data-act="close" aria-label="Close">${ICON.x}</button>
     </div>
-    <p class="meta">${[plural(spots.size, 'spot'), plural(photos, 'photo'), used].filter(Boolean).join(' · ')}</p>
+    <p class="meta">${esc([plural(spots.size, 'spot'), plural(photos, 'photo'), used].filter(Boolean).join(' · '))}</p>
     <p class="note">Everything is saved on this phone only. Nothing is uploaded. Make a backup now and then so you never lose your spots.</p>
     <div class="rows">
       <button class="row" data-act="export">Save a backup <span>to Files or iCloud Drive</span></button>
@@ -810,19 +810,31 @@ $('#fileImport').addEventListener('change', async e => {
     const data = JSON.parse(await f.text());
     if (data.app !== 'spot-map' || !Array.isArray(data.spots)) throw new Error('not a backup');
     let ns = 0, np = 0;
-    for (const s of data.spots) {
-      if (typeof s.id !== 'string' || !isFinite(s.lat) || !isFinite(s.lng) || spots.has(s.id)) continue;
-      s.lat = +s.lat; s.lng = +s.lng;
-      if (s.coverThumb && !String(s.coverThumb).startsWith('data:image/')) s.coverThumb = null;
+    // Rebuild every record from typed, allowed fields only (a backup file is untrusted input).
+    const str = (v, max) => String(v ?? '').slice(0, max);
+    const num = v => (Number.isFinite(+v) ? +v : 0);
+    const isImg = v => typeof v === 'string' && /^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(v);
+    for (const raw of data.spots) {
+      if (typeof raw.id !== 'string' || !/^[\w-]{1,64}$/.test(raw.id) || spots.has(raw.id)) continue;
+      const lat = +raw.lat, lng = +raw.lng;
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) continue;
+      const s = {
+        id: raw.id, name: str(raw.name, 80), notes: str(raw.notes, 5000), lat, lng,
+        createdAt: num(raw.createdAt) || Date.now(), updatedAt: num(raw.updatedAt) || Date.now(),
+        coverId: typeof raw.coverId === 'string' ? raw.coverId.slice(0, 64) : null,
+        coverThumb: isImg(raw.coverThumb) ? raw.coverThumb : null,
+        photoCount: Math.max(0, Math.floor(num(raw.photoCount))),
+      };
       await DB.put('spots', s); spots.set(s.id, s); renderMarker(s); ns++;
     }
     for (const p of data.photos || []) {
-      if (typeof p.id !== 'string' || typeof p.blob !== 'string' || !p.blob.startsWith('data:image/')) continue;
-      if (p.thumb && !String(p.thumb).startsWith('data:image/')) p.thumb = '';
+      if (typeof p.id !== 'string' || !/^[\w-]{1,64}$/.test(p.id) || typeof p.spotId !== 'string' || !isImg(p.blob)) continue;
       if (await DB.get('photos', p.id)) continue;
-      const { blob, ...rest } = p;
-      const b = await dataURLToBlob(blob);
-      await DB.put('photos', { ...rest, data: await b.arrayBuffer(), type: b.type || 'image/jpeg' }); np++;
+      const b = await dataURLToBlob(p.blob);
+      await DB.put('photos', {
+        id: p.id, spotId: p.spotId.slice(0, 64), data: await b.arrayBuffer(), type: b.type || 'image/jpeg',
+        thumb: isImg(p.thumb) ? p.thumb : '', takenAt: num(p.takenAt) || null, addedAt: num(p.addedAt) || Date.now(),
+      }); np++;
     }
     readyBackup = null;
     toast(`Restored ${plural(ns, 'spot')} and ${plural(np, 'photo')}.`);
